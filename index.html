@@ -697,7 +697,8 @@ let state = {
   detailModes:new Map(), // pitchId -> {base,outs,inning,score,batter,count}
   lastPitchObj:null,
   predictCorrect:0,
-  predictTotal:0
+  predictTotal:0,
+  pitchPredictions:new Map() // pitchId -> prediction result (incl. the modes it used)
 };
 const situationalProfileCache = new Map(); // pitcherId -> {source,label,rows}
 
@@ -1031,13 +1032,23 @@ function onPillClick(pitchId, dimension){
   renderDetailPanel(pitchId);
 }
 
+async function getDefaultModesForPitch(p){
+  // If this pitch already has a computed prediction, use the EXACT modes
+  // the predictor settled on - so the pills explain why it predicted what
+  // it did, rather than showing a different, unrelated default cascade.
+  const cached = state.pitchPredictions.get(p.id);
+  if(cached) return Object.assign({}, cached.modes);
+  const profile = await getSituationalProfile(p.pitcherId);
+  const auto = autoModesFor(profile.rows, p);
+  return auto.modes;
+}
+
 async function onResetPill(pitchId){
   const p = state.pitchesById.get(pitchId);
   if(!p) return;
   try{
-    const profile = await getSituationalProfile(p.pitcherId);
-    const auto = autoModesFor(profile.rows, p);
-    state.detailModes.set(pitchId, auto.modes);
+    const modes = await getDefaultModesForPitch(p);
+    state.detailModes.set(pitchId, modes);
     renderDetailPanel(pitchId);
   }catch(e){ /* leave as-is on failure */ }
 }
@@ -1066,11 +1077,10 @@ async function onPitchBubbleClick(pitchId){
   el.innerHTML = `<div class="detail-status">Loading situational history&hellip;</div>`;
 
   try{
-    const profile = await getSituationalProfile(p.pitcherId);
-    if(state.openDetailId !== pitchId) return;
     if(!state.detailModes.has(pitchId)){
-      const auto = autoModesFor(profile.rows, p);
-      state.detailModes.set(pitchId, auto.modes);
+      const modes = await getDefaultModesForPitch(p);
+      if(state.openDetailId !== pitchId) return;
+      state.detailModes.set(pitchId, modes);
     }
     await renderDetailPanel(pitchId);
   }catch(err){
@@ -1084,8 +1094,9 @@ function cssEscape(s){ return String(s).replace(/[^a-zA-Z0-9_-]/g,'_'); }
 async function schedulePredictionBadge(pitch){
   const result = await computePitchPrediction(pitch);
   const el = document.getElementById('predict-' + cssEscape(pitch.id));
-  if(!el) return; // pitch may have scrolled out / DOM rebuilt (e.g. game switch)
   if(!result) return;
+  state.pitchPredictions.set(pitch.id, result);
+  if(!el) return; // pitch may have scrolled out / DOM rebuilt (e.g. game switch)
   state.predictTotal++;
   if(result.correct){
     state.predictCorrect++;
@@ -1135,6 +1146,7 @@ function resetPitchLog(){
   state.lastPitchObj = null;
   state.predictCorrect = 0;
   state.predictTotal = 0;
+  state.pitchPredictions = new Map();
   pitchLogEl.innerHTML = `<div class="pitchlog-empty">Waiting for pitches&hellip;</div>`;
   pitchLogHead.textContent = 'Pitch log';
   jumpToLatestBtn.style.display = 'none';
