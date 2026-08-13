@@ -206,7 +206,21 @@
     text-transform:uppercase;
     letter-spacing:0.5px;
     margin-bottom:10px;
+    line-height:1.9;
   }
+  .pill{
+    cursor:pointer;
+    border-bottom:1px dotted var(--gold);
+    padding:2px 1px;
+  }
+  .pill:hover{color:#fff; border-bottom-color:#fff;}
+  .pill.reset-pill{
+    color:var(--ink-dim);
+    border-bottom:1px dotted var(--ink-dim);
+    margin-left:6px;
+    text-transform:none;
+  }
+  .pill.reset-pill:hover{color:var(--sel); border-bottom-color:var(--sel);}
 
   .stat-row-grid{
     display:grid;
@@ -424,6 +438,111 @@ function ordinal(n){
   return n + (s[(v-20)%10] || s[v] || s[0]);
 }
 
+// ---------- mode-aware situational dimensions ----------
+const BASE_MODES = ['exact','count','risp','any'];
+const OUTS_MODES = ['exact','any'];
+const INNING_MODES = ['exact','bucket','any'];
+const SCORE_MODES = ['exact','coarse','any'];
+
+function cycleMode(current, list){
+  const idx = list.indexOf(current);
+  return list[(idx+1) % list.length];
+}
+
+function scoreCoarse(diff){
+  const b = scoreBucket(diff);
+  if(b === null) return null;
+  if(b === 'tied') return 'tied';
+  if(b === 'ahead1' || b === 'ahead3') return 'leading';
+  return 'trailing';
+}
+
+function baseTestForMode(mode, target){
+  const count = (target.on1?1:0) + (target.on2?1:0) + (target.on3?1:0);
+  const risp = !!(target.on2 || target.on3);
+  if(mode === 'count') return r => ((r.on1?1:0)+(r.on2?1:0)+(r.on3?1:0)) === count;
+  if(mode === 'risp') return r => (!!(r.on2 || r.on3)) === risp;
+  if(mode === 'any') return () => true;
+  const key = baseKey(target.on1, target.on2, target.on3);
+  return r => baseKey(r.on1,r.on2,r.on3) === key;
+}
+function baseLabelForMode(mode, target){
+  const count = (target.on1?1:0) + (target.on2?1:0) + (target.on3?1:0);
+  if(mode === 'count'){
+    if(count===0) return 'Bases empty';
+    if(count===1) return 'One runner on';
+    if(count===2) return 'Two runners on';
+    return 'Bases loaded';
+  }
+  if(mode === 'risp') return (target.on2 || target.on3) ? 'Runner in scoring position' : 'No runner in scoring position';
+  if(mode === 'any') return 'Any base state';
+  return baseDescription(target.on1, target.on2, target.on3);
+}
+
+function outsTestForMode(mode, target){
+  if(mode === 'any') return () => true;
+  return r => r.outs === target.outs;
+}
+function outsLabelForMode(mode, target){
+  if(mode === 'any') return 'any outs';
+  return `${target.outs}${target.outs===1?' out':' outs'}`;
+}
+
+function inningTestForMode(mode, target){
+  if(mode === 'any') return () => true;
+  if(mode === 'bucket'){ const b = inningBucket(target.inning); return r => inningBucket(r.inning) === b; }
+  return r => r.inning === target.inning;
+}
+function inningLabelForMode(mode, target){
+  if(mode === 'any') return 'any inning';
+  if(mode === 'bucket'){
+    const b = inningBucket(target.inning);
+    return b==='early' ? 'innings 1\u20133' : (b==='mid' ? 'innings 4\u20136' : 'innings 7+');
+  }
+  return `${ordinal(target.inning)} inning`;
+}
+
+function scoreTestForMode(mode, target){
+  if(mode === 'any') return () => true;
+  if(mode === 'coarse'){ const c = scoreCoarse(target.scoreDiff); return r => scoreCoarse(r.scoreDiff) === c; }
+  const b = scoreBucket(target.scoreDiff);
+  return r => scoreBucket(r.scoreDiff) === b;
+}
+function scoreLabelForMode(mode, target){
+  if(mode === 'any') return 'any score';
+  if(mode === 'coarse'){
+    const c = scoreCoarse(target.scoreDiff);
+    return c==='tied' ? 'tied' : (c==='leading' ? 'leading' : 'trailing');
+  }
+  return scoreDescription(target.scoreDiff);
+}
+
+function matchWithModes(rows, target, modes){
+  const bTest = baseTestForMode(modes.base, target);
+  const oTest = outsTestForMode(modes.outs, target);
+  const iTest = inningTestForMode(modes.inning, target);
+  const sTest = scoreTestForMode(modes.score, target);
+  return rows.filter(r => bTest(r) && oTest(r) && iTest(r) && sTest(r));
+}
+
+const AUTO_STAGES = [
+  {base:'exact', outs:'exact', inning:'exact',  score:'exact'},
+  {base:'exact', outs:'exact', inning:'bucket', score:'exact'},
+  {base:'exact', outs:'exact', inning:'bucket', score:'any'},
+  {base:'exact', outs:'exact', inning:'any',    score:'any'}
+];
+function autoModesFor(rows, target){
+  const MIN_SAMPLE = 6;
+  for(let i=0;i<AUTO_STAGES.length;i++){
+    const modes = AUTO_STAGES[i];
+    const matched = matchWithModes(rows, target, modes);
+    if(matched.length >= MIN_SAMPLE || i === AUTO_STAGES.length-1){
+      return { modes: Object.assign({}, modes), wasRelaxed: i > 0 };
+    }
+  }
+  return { modes: Object.assign({}, AUTO_STAGES[0]), wasRelaxed:false };
+}
+
 const topStatus = document.getElementById('topStatus');
 const matchupBar = document.getElementById('matchupBar');
 const logPanel = document.getElementById('logPanel');
@@ -443,7 +562,8 @@ let state = {
   loggedPitchCount:0,
   lastAtBatIndex:null,
   autoScroll:true,
-  openDetailId:null
+  openDetailId:null,
+  detailModes:new Map() // pitchId -> {base,outs,inning,score}
 };
 const situationalProfileCache = new Map(); // pitcherId -> {source,label,rows}
 
@@ -642,29 +762,6 @@ async function getSituationalProfile(pitcherId){
   return profile;
 }
 
-// ---------- matching ----------
-function findSituationalMatches(rows, target){
-  const targetBase = baseKey(target.on1, target.on2, target.on3);
-  const stages = [
-    { label:null,
-      test: r => baseKey(r.on1,r.on2,r.on3)===targetBase && r.outs===target.outs && r.inning===target.inning && scoreBucket(r.scoreDiff)===scoreBucket(target.scoreDiff) },
-    { label:'broadened inning to early/mid/late',
-      test: r => baseKey(r.on1,r.on2,r.on3)===targetBase && r.outs===target.outs && inningBucket(r.inning)===inningBucket(target.inning) && scoreBucket(r.scoreDiff)===scoreBucket(target.scoreDiff) },
-    { label:'dropped the score situation',
-      test: r => baseKey(r.on1,r.on2,r.on3)===targetBase && r.outs===target.outs && inningBucket(r.inning)===inningBucket(target.inning) },
-    { label:'matched on baserunners & outs only',
-      test: r => baseKey(r.on1,r.on2,r.on3)===targetBase && r.outs===target.outs }
-  ];
-  const MIN_SAMPLE = 6;
-  for(let i=0;i<stages.length;i++){
-    const matched = rows.filter(stages[i].test);
-    if(matched.length >= MIN_SAMPLE || i === stages.length-1){
-      return { matched, relaxedNote: stages[i].label };
-    }
-  }
-  return { matched: [], relaxedNote: null };
-}
-
 function effectivenessOf(rows){
   let whiff=0, called=0, foul=0, inplay=0, ball=0, hbp=0;
   const hits = { single:0, double:0, triple:0, home_run:0 };
@@ -688,17 +785,35 @@ function effectivenessOf(rows){
 }
 
 // ---------- rendering: detail panel ----------
-function buildSituationalDetailHtml(target, result, sourceLabel){
-  const { matched, relaxedNote } = result;
-  if(matched.length === 0){
-    return `<div class="detail-status">No comparable pitches on record for this situation.</div>`;
-  }
+function pillsHtml(pitchId, target, modes){
+  const base = baseLabelForMode(modes.base, target);
+  const outs = outsLabelForMode(modes.outs, target);
+  const score = scoreLabelForMode(modes.score, target);
+  const inning = inningLabelForMode(modes.inning, target);
+  return `<div class="situation-sub">
+    <span class="pill" onclick="onPillClick('${pitchId}','base')" title="Tap to change">${base}</span>,
+    <span class="pill" onclick="onPillClick('${pitchId}','outs')" title="Tap to change">${outs}</span>,
+    <span class="pill" onclick="onPillClick('${pitchId}','score')" title="Tap to change">${score}</span>,
+    <span class="pill" onclick="onPillClick('${pitchId}','inning')" title="Tap to change">${inning}</span>
+    <span class="pill reset-pill" onclick="onResetPill('${pitchId}')" title="Reset to default">reset</span>
+  </div>`;
+}
+
+function buildSituationalDetailHtml(target, matched, modes, sourceLabel, pitchId){
   const targetLabel = pitchLabelOf(target);
+  const pills = pillsHtml(pitchId, target, modes);
+
+  if(matched.length === 0){
+    return `
+      <div class="situation-label">${targetLabel} in this spot</div>
+      ${pills}
+      <div class="detail-status">No comparable pitches match this exact combination. Try tapping a filter above to broaden it.</div>
+    `;
+  }
+
   const sameType = matched.filter(r => pitchLabelOf(r) === targetLabel);
   const eff = effectivenessOf(sameType);
   const usagePct = pct(sameType.length, matched.length);
-
-  const situationTxt = `${baseDescription(target.on1,target.on2,target.on3)}, ${target.outs}${target.outs===1?' out':' outs'}, ${scoreDescription(target.scoreDiff)}, ${ordinal(target.inning)} inning`;
 
   const statBoxes = `
     <div class="stat-row-grid">
@@ -729,16 +844,57 @@ function buildSituationalDetailHtml(target, result, sourceLabel){
     </div>`;
   }).join('');
 
+  const smallSampleNote = matched.length < 6
+    ? `<div class="detail-foot" style="color:#e0b04a;">Small sample (${matched.length} comparable pitches) \u2014 tap a filter above to broaden it.</div>`
+    : '';
+
   return `
     <div class="situation-label">${targetLabel} in this spot</div>
-    <div class="situation-sub">${situationTxt}${relaxedNote ? ` \u2014 ${relaxedNote} (sample was thin)` : ''}</div>
+    ${pills}
     ${statBoxes}
     <div class="mix-section">
       <div class="section-label">Full mix in this situation (${matched.length} pitches)</div>
       ${mixHtml}
     </div>
+    ${smallSampleNote}
     <div class="detail-foot">${sourceLabel}</div>
   `;
+}
+
+async function renderDetailPanel(pitchId){
+  const p = state.pitchesById.get(pitchId);
+  const el = document.getElementById('detail-' + cssEscape(pitchId));
+  if(!p || !el) return;
+  const modes = state.detailModes.get(pitchId);
+  if(!modes) return;
+  try{
+    const profile = await getSituationalProfile(p.pitcherId);
+    if(state.openDetailId !== pitchId) return;
+    const matched = matchWithModes(profile.rows, p, modes);
+    el.innerHTML = buildSituationalDetailHtml(p, matched, modes, profile.label, pitchId);
+  }catch(err){
+    if(state.openDetailId !== pitchId) return;
+    el.innerHTML = `<div class="detail-status error">${err.message || 'Could not load history.'}</div>`;
+  }
+}
+
+function onPillClick(pitchId, dimension){
+  const modes = state.detailModes.get(pitchId);
+  if(!modes) return;
+  const lists = { base:BASE_MODES, outs:OUTS_MODES, inning:INNING_MODES, score:SCORE_MODES };
+  modes[dimension] = cycleMode(modes[dimension], lists[dimension]);
+  renderDetailPanel(pitchId);
+}
+
+async function onResetPill(pitchId){
+  const p = state.pitchesById.get(pitchId);
+  if(!p) return;
+  try{
+    const profile = await getSituationalProfile(p.pitcherId);
+    const auto = autoModesFor(profile.rows, p);
+    state.detailModes.set(pitchId, auto.modes);
+    renderDetailPanel(pitchId);
+  }catch(e){ /* leave as-is on failure */ }
 }
 
 async function onPitchBubbleClick(pitchId){
@@ -767,8 +923,11 @@ async function onPitchBubbleClick(pitchId){
   try{
     const profile = await getSituationalProfile(p.pitcherId);
     if(state.openDetailId !== pitchId) return;
-    const result = findSituationalMatches(profile.rows, p);
-    el.innerHTML = buildSituationalDetailHtml(p, result, profile.label);
+    if(!state.detailModes.has(pitchId)){
+      const auto = autoModesFor(profile.rows, p);
+      state.detailModes.set(pitchId, auto.modes);
+    }
+    await renderDetailPanel(pitchId);
   }catch(err){
     if(state.openDetailId !== pitchId) return;
     el.innerHTML = `<div class="detail-status error">${err.message || 'Could not load history.'}</div>`;
@@ -785,6 +944,7 @@ function resetPitchLog(){
   state.lastAtBatIndex = null;
   state.autoScroll = true;
   state.openDetailId = null;
+  state.detailModes = new Map();
   pitchLogEl.innerHTML = `<div class="pitchlog-empty">Waiting for pitches&hellip;</div>`;
   pitchLogHead.textContent = 'Pitch log';
   jumpToLatestBtn.style.display = 'none';
