@@ -172,6 +172,23 @@
     letter-spacing:0.5px;
   }
 
+  .predict-badge{font-size:10px;}
+  .predict-correct{color:#7FD858; font-weight:700;}
+  .predict-wrong{color:#e0574f; font-weight:700;}
+
+  .up-next-card{
+    background:rgba(79,168,224,0.1);
+    border-bottom:1px solid var(--panel-line);
+    padding:9px 16px;
+    font-family:'JetBrains Mono',monospace;
+    font-size:11.5px;
+    color:var(--silver);
+    text-align:center;
+  }
+  .up-next-label{color:var(--ink-dim); text-transform:uppercase; font-size:9.5px; letter-spacing:0.5px;}
+  .up-next-card strong{color:var(--gold);}
+  .up-next-pct{color:var(--ink-dim); font-size:10px;}
+
   .pitch-detail{
     display:none;
     margin:4px 4px 2px;
@@ -342,6 +359,7 @@
       <span id="pitchLogHead">Pitch log</span>
       <span class="log-hint">Tap a pitch for its history</span>
     </div>
+    <div id="upNextCard" class="up-next-card" style="display:none;"></div>
     <div class="pitch-log" id="pitchLog"><div class="pitchlog-empty">Waiting for pitches&hellip;</div></div>
     <button id="jumpToLatestBtn" class="jump-latest-btn">&#8595; New pitches</button>
   </div>
@@ -570,6 +588,74 @@ function matchWithModes(rows, target, modes){
   return rows.filter(r => bTest(r) && oTest(r) && iTest(r) && sTest(r) && hTest(r) && cTest(r));
 }
 
+// ---------- predictor: greedy, data-driven relaxation (no fixed hierarchy) ----------
+// Each dimension has its own ladder of specificity. Starts fully specific
+// (batter starts at 'hand', not 'exact' - exact-batter is an ex post feature
+// only, never used for prediction). At each step, relax whichever dimension's
+// next-looser level unlocks the MOST new matching pitches for THIS pitcher -
+// decided empirically per pitcher, not from a fixed importance order.
+const PREDICT_DIM_LEVELS = {
+  inning: ['exact','bucket','any'],
+  score:  ['exact','coarse','any'],
+  outs:   ['exact','any'],
+  base:   ['exact','count','risp','any'],
+  batter: ['hand','any'],
+  count:  ['exact','bucket','any']
+};
+const PREDICT_MIN_SAMPLE = 6;
+const PREDICT_MAX_STEPS = 12;
+
+function greedyPredict(rows, target){
+  if(!rows || rows.length === 0) return null;
+  let modes = { inning:'exact', score:'exact', outs:'exact', base:'exact', batter:'hand', count:'exact' };
+  let matched = matchWithModes(rows, target, modes);
+  const relaxLog = [];
+
+  for(let step=0; step<PREDICT_MAX_STEPS && matched.length<PREDICT_MIN_SAMPLE; step++){
+    let bestDim=null, bestGain=-1, bestModes=null, bestMatched=null;
+    for(const dim of Object.keys(PREDICT_DIM_LEVELS)){
+      const levels = PREDICT_DIM_LEVELS[dim];
+      const curIdx = levels.indexOf(modes[dim]);
+      if(curIdx === levels.length-1) continue; // already fully relaxed on this dimension
+      const trialModes = Object.assign({}, modes);
+      trialModes[dim] = levels[curIdx+1];
+      const trialMatched = matchWithModes(rows, target, trialModes);
+      const gain = trialMatched.length - matched.length;
+      if(gain > bestGain){ bestGain=gain; bestDim=dim; bestModes=trialModes; bestMatched=trialMatched; }
+    }
+    if(!bestDim) break; // nothing left to relax
+    modes = bestModes;
+    matched = bestMatched;
+    relaxLog.push(bestDim);
+  }
+
+  if(matched.length === 0) return null;
+
+  const counts = {};
+  matched.forEach(r => { const l = pitchLabelOf(r); counts[l] = (counts[l]||0)+1; });
+  const ranked = Object.entries(counts).sort((a,b) => b[1]-a[1]);
+  const [predictedLabel, predictedCount] = ranked[0];
+
+  return {
+    predictedLabel,
+    confidencePct: pct(predictedCount, matched.length),
+    sampleSize: matched.length,
+    modes,
+    relaxLog
+  };
+}
+
+async function computePitchPrediction(pitch){
+  if(!pitch.pitcherId || !pitch.pitch_type) return null;
+  try{
+    const profile = await getSituationalProfile(pitch.pitcherId);
+    const result = greedyPredict(profile.rows, pitch);
+    if(!result) return null;
+    const actualLabel = pitchLabelOf(pitch);
+    return Object.assign({}, result, { actualLabel, correct: result.predictedLabel === actualLabel });
+  }catch(e){ return null; }
+}
+
 const AUTO_STAGES = [
   {base:'exact', outs:'exact', inning:'exact',  score:'exact', batter:'any', count:'any'},
   {base:'exact', outs:'exact', inning:'bucket', score:'exact', batter:'any', count:'any'},
@@ -608,7 +694,10 @@ let state = {
   lastAtBatIndex:null,
   autoScroll:true,
   openDetailId:null,
-  detailModes:new Map() // pitchId -> {base,outs,inning,score}
+  detailModes:new Map(), // pitchId -> {base,outs,inning,score,batter,count}
+  lastPitchObj:null,
+  predictCorrect:0,
+  predictTotal:0
 };
 const situationalProfileCache = new Map(); // pitcherId -> {source,label,rows}
 
@@ -806,11 +895,12 @@ async function fetchSituationalFallback(pitcherId){
 
 async function getSituationalProfile(pitcherId){
   if(situationalProfileCache.has(pitcherId)) return situationalProfileCache.get(pitcherId);
-  let profile;
-  try{ profile = await fetchSituationalSavant(pitcherId); }
-  catch(e){ profile = await fetchSituationalFallback(pitcherId); }
-  situationalProfileCache.set(pitcherId, profile);
-  return profile;
+  const promise = (async () => {
+    try{ return await fetchSituationalSavant(pitcherId); }
+    catch(e){ return await fetchSituationalFallback(pitcherId); }
+  })();
+  situationalProfileCache.set(pitcherId, promise); // cache the promise itself to dedupe concurrent callers
+  return promise;
 }
 
 function effectivenessOf(rows){
@@ -991,6 +1081,48 @@ async function onPitchBubbleClick(pitchId){
 
 function cssEscape(s){ return String(s).replace(/[^a-zA-Z0-9_-]/g,'_'); }
 
+async function schedulePredictionBadge(pitch){
+  const result = await computePitchPrediction(pitch);
+  const el = document.getElementById('predict-' + cssEscape(pitch.id));
+  if(!el) return; // pitch may have scrolled out / DOM rebuilt (e.g. game switch)
+  if(!result) return;
+  state.predictTotal++;
+  if(result.correct){
+    state.predictCorrect++;
+    el.innerHTML = `&middot; <span class="predict-correct">&#10003; predicted</span>`;
+  }else{
+    el.innerHTML = `&middot; <span class="predict-wrong">&#10007; expected ${result.predictedLabel}</span>`;
+  }
+  pitchLogHead.textContent = `Pitch log \u00b7 ${state.loggedPitchCount} pitches \u00b7 predicted ${state.predictCorrect}/${state.predictTotal}`;
+}
+
+async function updateUpcomingPrediction(){
+  const last = state.lastPitchObj;
+  const card = document.getElementById('upNextCard');
+  if(!card) return;
+  if(!last || last.paResult){
+    // At-bat just ended (or nothing logged yet) - next batter isn't known
+    // until their first pitch arrives, so there's nothing honest to show.
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = 'block';
+  card.innerHTML = `<div class="detail-status">Predicting next pitch&hellip;</div>`;
+  const forPitchId = last.id;
+  try{
+    const profile = await getSituationalProfile(last.pitcherId);
+    if(!state.lastPitchObj || state.lastPitchObj.id !== forPitchId) return; // stale by the time this resolves
+    const result = greedyPredict(profile.rows, last);
+    if(!result){
+      card.innerHTML = `<div class="detail-status">Not enough history to predict here yet.</div>`;
+      return;
+    }
+    card.innerHTML = `<span class="up-next-label">Up next, most likely:</span> <strong>${result.predictedLabel}</strong> <span class="up-next-pct">(${result.confidencePct}%, n=${result.sampleSize})</span>`;
+  }catch(e){
+    card.innerHTML = `<div class="detail-status error">Could not compute a prediction.</div>`;
+  }
+}
+
 // ---------- rendering: log ----------
 function resetPitchLog(){
   state.renderedPitchIds = new Set();
@@ -1000,9 +1132,14 @@ function resetPitchLog(){
   state.autoScroll = true;
   state.openDetailId = null;
   state.detailModes = new Map();
+  state.lastPitchObj = null;
+  state.predictCorrect = 0;
+  state.predictTotal = 0;
   pitchLogEl.innerHTML = `<div class="pitchlog-empty">Waiting for pitches&hellip;</div>`;
   pitchLogHead.textContent = 'Pitch log';
   jumpToLatestBtn.style.display = 'none';
+  const card = document.getElementById('upNextCard');
+  if(card){ card.style.display = 'none'; card.innerHTML = ''; }
 }
 
 function isPitchLogNearBottom(){
@@ -1032,12 +1169,12 @@ function appendPitches(pitches){
     const fg = readableTextColor(bg);
     const speedTxt = p.speed !== null && p.speed !== undefined ? `${Number(p.speed).toFixed(1)} mph` : '\u2014 mph';
     const countTxt = (p.balls !== null && p.strikes !== null) ? `${p.balls}-${p.strikes}` : '\u2014';
-    const label = p.pitch_name || PITCH_NAMES[p.pitch_type] || p.pitch_type || 'Pitch';
+    const label = pitchLabelOf(p);
     const safeId = cssEscape(p.id);
     html += `<div class="pitch-wrap side-${p.side||'away'}">
       <div class="pitch-entry side-${p.side||'away'}" style="background:${bg}; color:${fg};" onclick="onPitchBubbleClick('${p.id}')">
         <div class="l1">${label} &middot; ${speedTxt} <span class="tap-hint">tap &#8594;</span></div>
-        <div class="l2">${p.call || '\u2014'} &middot; ${countTxt}</div>
+        <div class="l2">${p.call || '\u2014'} &middot; ${countTxt} <span class="predict-badge" id="predict-${safeId}"></span></div>
         ${p.paResult ? `<div class="l3">\u2192 ${p.paResult}</div>` : ''}
       </div>
       <div class="pitch-detail" id="detail-${safeId}"></div>
@@ -1053,6 +1190,13 @@ function appendPitches(pitches){
   }else{
     jumpToLatestBtn.style.display = 'block';
   }
+
+  // Score each new pitch against what would have been predicted for its own
+  // situation - applies uniformly whether it was backfilled or just landed.
+  newOnes.forEach(p => { schedulePredictionBadge(p); });
+
+  state.lastPitchObj = newOnes[newOnes.length - 1];
+  updateUpcomingPrediction();
 }
 
 // ---------- game load / poll ----------
