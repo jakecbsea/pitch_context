@@ -382,7 +382,13 @@ const PITCH_NAMES = {
   CH:'Changeup', FS:'Splitter', FO:'Forkball', SC:'Screwball', KN:'Knuckleball',
   EP:'Eephus', PO:'Pitch Out', IN:'Intentional Ball', UN:'Unknown'
 };
-function pitchLabelOf(r){ return r.pitch_name || PITCH_NAMES[r.pitch_type] || r.pitch_type || 'Unknown'; }
+function pitchLabelOf(r){
+  // Prefer the canonical name derived from pitch_type CODE, not the free-text
+  // name string - MLB's live feed says "Four-Seam Fastball" while Savant says
+  // "4-Seam Fastball" for the same pitch, which would otherwise fail to match.
+  if(r.pitch_type && PITCH_NAMES[r.pitch_type]) return PITCH_NAMES[r.pitch_type];
+  return r.pitch_name || r.pitch_type || 'Unknown';
+}
 
 function classifyOutcome(raw){
   if(!raw) return null;
@@ -443,10 +449,19 @@ const BASE_MODES = ['exact','count','risp','any'];
 const OUTS_MODES = ['exact','any'];
 const INNING_MODES = ['exact','bucket','any'];
 const SCORE_MODES = ['exact','coarse','any'];
+const BATTER_MODES = ['any','hand','exact'];
+const COUNT_MODES = ['any','bucket','exact'];
 
 function cycleMode(current, list){
   const idx = list.indexOf(current);
   return list[(idx+1) % list.length];
+}
+
+function countBucket(balls, strikes){
+  if(balls===null || balls===undefined || strikes===null || strikes===undefined) return null;
+  if(strikes > balls) return 'ahead';
+  if(balls > strikes) return 'behind';
+  return 'even';
 }
 
 function scoreCoarse(diff){
@@ -517,19 +532,49 @@ function scoreLabelForMode(mode, target){
   return scoreDescription(target.scoreDiff);
 }
 
+function batterTestForMode(mode, target){
+  if(mode === 'exact') return r => r.batterId !== null && r.batterId === target.batterId;
+  if(mode === 'hand') return r => target.stand !== null && r.stand === target.stand;
+  return () => true; // 'any'
+}
+function batterLabelForMode(mode, target){
+  if(mode === 'exact') return target.batterName ? `vs ${target.batterName}` : 'vs this batter';
+  if(mode === 'hand') return target.stand ? `vs ${target.stand}HB` : 'vs same-handed batters';
+  return 'any batter';
+}
+
+function countTestForMode(mode, target){
+  if(mode === 'exact') return r => r.balls === target.balls && r.strikes === target.strikes;
+  if(mode === 'bucket'){ const b = countBucket(target.balls, target.strikes); return r => countBucket(r.balls, r.strikes) === b; }
+  return () => true; // 'any'
+}
+function countLabelForMode(mode, target){
+  if(mode === 'exact') return (target.balls!==null && target.strikes!==null) ? `${target.balls}-${target.strikes} count` : 'count unknown';
+  if(mode === 'bucket'){
+    const b = countBucket(target.balls, target.strikes);
+    if(b === 'ahead') return 'ahead in count';
+    if(b === 'behind') return 'behind in count';
+    if(b === 'even') return 'even count';
+    return 'count unknown';
+  }
+  return 'any count';
+}
+
 function matchWithModes(rows, target, modes){
   const bTest = baseTestForMode(modes.base, target);
   const oTest = outsTestForMode(modes.outs, target);
   const iTest = inningTestForMode(modes.inning, target);
   const sTest = scoreTestForMode(modes.score, target);
-  return rows.filter(r => bTest(r) && oTest(r) && iTest(r) && sTest(r));
+  const hTest = batterTestForMode(modes.batter, target);
+  const cTest = countTestForMode(modes.count, target);
+  return rows.filter(r => bTest(r) && oTest(r) && iTest(r) && sTest(r) && hTest(r) && cTest(r));
 }
 
 const AUTO_STAGES = [
-  {base:'exact', outs:'exact', inning:'exact',  score:'exact'},
-  {base:'exact', outs:'exact', inning:'bucket', score:'exact'},
-  {base:'exact', outs:'exact', inning:'bucket', score:'any'},
-  {base:'exact', outs:'exact', inning:'any',    score:'any'}
+  {base:'exact', outs:'exact', inning:'exact',  score:'exact', batter:'any', count:'any'},
+  {base:'exact', outs:'exact', inning:'bucket', score:'exact', batter:'any', count:'any'},
+  {base:'exact', outs:'exact', inning:'bucket', score:'any',   batter:'any', count:'any'},
+  {base:'exact', outs:'exact', inning:'any',    score:'any',   batter:'any', count:'any'}
 ];
 function autoModesFor(rows, target){
   const MIN_SAMPLE = 6;
@@ -631,7 +676,9 @@ function extractPitchesWithState(plays, homeTeamId, awayTeamId, filterPitcherId)
           side: isTop === true ? 'home' : (isTop === false ? 'away' : null),
           pitcherId: pitcherObj ? pitcherObj.id : null,
           pitcherName: pitcherObj ? pitcherObj.fullName : 'Pitcher',
+          batterId: batterObj ? batterObj.id : null,
           batterName: batterObj ? batterObj.fullName : 'Batter',
+          stand: play.matchup.batSide ? play.matchup.batSide.code : null,
           pitch_type: ev.details.type ? ev.details.type.code : null,
           pitch_name: ev.details.type ? ev.details.type.description : null,
           speed: pd.startSpeed !== undefined ? pd.startSpeed : null,
@@ -708,6 +755,10 @@ async function fetchSituationalSavant(pitcherId){
     inning: r.inning!==undefined && r.inning!==null ? Number(r.inning) : null,
     scoreDiff: (r.fld_score!==undefined && r.fld_score!==null && r.bat_score!==undefined && r.bat_score!==null)
       ? Number(r.fld_score) - Number(r.bat_score) : null,
+    batterId: r.batter!==undefined && r.batter!==null ? Number(r.batter) : null,
+    stand: r.stand || null,
+    balls: r.balls!==undefined && r.balls!==null ? Number(r.balls) : null,
+    strikes: r.strikes!==undefined && r.strikes!==null ? Number(r.strikes) : null,
     outcome_raw: r.description || null,
     events: r.events || null
   }));
@@ -788,13 +839,17 @@ function effectivenessOf(rows){
 function pillsHtml(pitchId, target, modes){
   const base = baseLabelForMode(modes.base, target);
   const outs = outsLabelForMode(modes.outs, target);
+  const count = countLabelForMode(modes.count, target);
   const score = scoreLabelForMode(modes.score, target);
   const inning = inningLabelForMode(modes.inning, target);
+  const batter = batterLabelForMode(modes.batter, target);
   return `<div class="situation-sub">
     <span class="pill" onclick="onPillClick('${pitchId}','base')" title="Tap to change">${base}</span>,
     <span class="pill" onclick="onPillClick('${pitchId}','outs')" title="Tap to change">${outs}</span>,
+    <span class="pill" onclick="onPillClick('${pitchId}','count')" title="Tap to change">${count}</span>,
     <span class="pill" onclick="onPillClick('${pitchId}','score')" title="Tap to change">${score}</span>,
-    <span class="pill" onclick="onPillClick('${pitchId}','inning')" title="Tap to change">${inning}</span>
+    <span class="pill" onclick="onPillClick('${pitchId}','inning')" title="Tap to change">${inning}</span>,
+    <span class="pill" onclick="onPillClick('${pitchId}','batter')" title="Tap to change">${batter}</span>
     <span class="pill reset-pill" onclick="onResetPill('${pitchId}')" title="Reset to default">reset</span>
   </div>`;
 }
@@ -881,7 +936,7 @@ async function renderDetailPanel(pitchId){
 function onPillClick(pitchId, dimension){
   const modes = state.detailModes.get(pitchId);
   if(!modes) return;
-  const lists = { base:BASE_MODES, outs:OUTS_MODES, inning:INNING_MODES, score:SCORE_MODES };
+  const lists = { base:BASE_MODES, outs:OUTS_MODES, inning:INNING_MODES, score:SCORE_MODES, batter:BATTER_MODES, count:COUNT_MODES };
   modes[dimension] = cycleMode(modes[dimension], lists[dimension]);
   renderDetailPanel(pitchId);
 }
