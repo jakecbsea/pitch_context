@@ -323,6 +323,33 @@
   .jump-latest-btn:hover{filter:brightness(1.1);}
 
   .refresh-row{text-align:center; margin-top:20px;}
+
+  .log-export-row{
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:10px;
+    flex-wrap:wrap;
+    margin-top:14px;
+    font-family:'JetBrains Mono',monospace;
+    font-size:10px;
+    color:var(--ink-dim);
+  }
+  .log-export-btn{
+    font-family:'JetBrains Mono',monospace;
+    font-size:10px;
+    letter-spacing:0.5px;
+    color:#F4F2EA;
+    background:var(--panel);
+    border:1px solid var(--panel-line);
+    border-radius:6px;
+    padding:5px 10px;
+    cursor:pointer;
+    text-transform:uppercase;
+  }
+  .log-export-btn:hover{border-color:var(--sel); color:var(--sel);}
+  .log-export-btn.subtle{color:var(--ink-dim); border-color:transparent; background:transparent;}
+  .log-export-btn.subtle:hover{color:#e0574f; border-color:transparent; background:transparent;}
   button#refresh{
     font-family:'Oswald',sans-serif;
     font-weight:600;
@@ -366,6 +393,12 @@
 
   <div class="refresh-row">
     <button id="refresh">Refresh</button>
+  </div>
+
+  <div class="log-export-row">
+    <span id="logCountLabel">0 predictions logged all-time</span>
+    <button id="exportLogBtn" class="log-export-btn">Export JSON</button>
+    <button id="clearLogBtn" class="log-export-btn subtle">Clear</button>
   </div>
 </div>
 
@@ -454,7 +487,8 @@ function inningBucket(inn){
   if(inn === null || inn === undefined) return null;
   if(inn <= 3) return 'early';
   if(inn <= 6) return 'mid';
-  return 'late';
+  if(inn <= 8) return 'late';
+  return 'ninth'; // 9th inning and extras - save situations are their own regime, not just "more late"
 }
 function ordinal(n){
   if(n===null||n===undefined) return '?';
@@ -530,7 +564,11 @@ function inningLabelForMode(mode, target){
   if(mode === 'any') return 'any inning';
   if(mode === 'bucket'){
     const b = inningBucket(target.inning);
-    return b==='early' ? 'innings 1\u20133' : (b==='mid' ? 'innings 4\u20136' : 'innings 7+');
+    if(b==='early') return 'innings 1\u20133';
+    if(b==='mid') return 'innings 4\u20136';
+    if(b==='late') return 'innings 7\u20138';
+    if(b==='ninth') return '9th+ (closer situations)';
+    return 'inning unknown';
   }
   return `${ordinal(target.inning)} inning`;
 }
@@ -1091,11 +1129,78 @@ async function onPitchBubbleClick(pitchId){
 
 function cssEscape(s){ return String(s).replace(/[^a-zA-Z0-9_-]/g,'_'); }
 
+// ---------- persistent prediction log (localStorage) ----------
+// Survives page reloads (unlike in-memory session state). Keyed by pitch id
+// so re-opening the same game never double-logs the same pitch.
+const PREDICTION_LOG_KEY = 'pitchContextPredictionLog_v1';
+
+function loadPredictionLog(){
+  try{
+    const raw = localStorage.getItem(PREDICTION_LOG_KEY);
+    return raw ? JSON.parse(raw) : {};
+  }catch(e){ return {}; }
+}
+
+function savePredictionLogEntry(pitch, result){
+  try{
+    const log = loadPredictionLog();
+    log[pitch.id] = {
+      loggedAt: new Date().toISOString(),
+      gamePk: state.gamePk,
+      pitcherId: pitch.pitcherId, pitcherName: pitch.pitcherName,
+      batterId: pitch.batterId, batterName: pitch.batterName, stand: pitch.stand,
+      on1: pitch.on1, on2: pitch.on2, on3: pitch.on3,
+      outs: pitch.outs, inning: pitch.inning, scoreDiff: pitch.scoreDiff,
+      balls: pitch.balls, strikes: pitch.strikes,
+      predictedLabel: result.predictedLabel,
+      actualLabel: result.actualLabel,
+      correct: result.correct,
+      confidencePct: result.confidencePct,
+      sampleSize: result.sampleSize,
+      modesUsed: result.modes,
+      relaxLog: result.relaxLog
+    };
+    localStorage.setItem(PREDICTION_LOG_KEY, JSON.stringify(log));
+  }catch(e){ /* storage unavailable or full - in-memory scoring still works fine without it */ }
+}
+
+function predictionLogCount(){
+  return Object.keys(loadPredictionLog()).length;
+}
+
+function updateLogCountDisplay(){
+  const el = document.getElementById('logCountLabel');
+  if(el) el.textContent = `${predictionLogCount().toLocaleString()} predictions logged all-time`;
+}
+
+function exportPredictionLog(){
+  const log = loadPredictionLog();
+  const entries = Object.values(log).sort((a,b) => new Date(a.loggedAt) - new Date(b.loggedAt));
+  if(entries.length === 0){ alert('No predictions logged yet - watch a game with a pitcher on the mound first.'); return; }
+  const blob = new Blob([JSON.stringify(entries, null, 2)], { type:'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `pitch-context-predictions-${new Date().toISOString().slice(0,10)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function clearPredictionLog(){
+  if(!confirm('Clear all logged predictions? This can\'t be undone.')) return;
+  try{ localStorage.removeItem(PREDICTION_LOG_KEY); }catch(e){}
+  updateLogCountDisplay();
+}
+
 async function schedulePredictionBadge(pitch){
   const result = await computePitchPrediction(pitch);
   const el = document.getElementById('predict-' + cssEscape(pitch.id));
   if(!result) return;
   state.pitchPredictions.set(pitch.id, result);
+  savePredictionLogEntry(pitch, result);
+  updateLogCountDisplay();
   if(!el) return; // pitch may have scrolled out / DOM rebuilt (e.g. game switch)
   state.predictTotal++;
   if(result.correct){
@@ -1303,6 +1408,10 @@ jumpToLatestBtn.addEventListener('click', () => {
   pitchLogEl.scrollTop = pitchLogEl.scrollHeight;
   jumpToLatestBtn.style.display = 'none';
 });
+
+document.getElementById('exportLogBtn').addEventListener('click', exportPredictionLog);
+document.getElementById('clearLogBtn').addEventListener('click', clearPredictionLog);
+updateLogCountDisplay();
 
 init();
 </script>
